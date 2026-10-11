@@ -1,0 +1,16 @@
+[
+  {
+    "time": "2026-10-11T04:09:22.591Z",
+    "event": "realtime provider session closed",
+    "sessionId": "live_fd5d77ee41324d999968309b1d3ae8ae",
+    "providerCode": 1006,
+    "code": null
+  },
+  {
+    "time": "2026-10-11T04:09:22.592Z",
+    "event": "live session error",
+    "sessionId": "live_fd5d77ee41324d999968309b1d3ae8ae",
+    "providerCode": null,
+    "code": "realtime_provider_closed"
+  }
+]
