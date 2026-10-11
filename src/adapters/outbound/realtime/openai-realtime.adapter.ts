@@ -172,9 +172,10 @@ class OpenAIRealtimeSession implements LiveModelSession {
     this.ws.on("close", (code, reason) => {
       this.closing = true;
       this.resetResponseState();
+      callbacks.onTransportClose?.({ code });
       callbacks.onClose?.({ code, reason: reason.toString("utf8") });
     });
-    this.ws.on("error", (error) => callbacks.onError?.(error));
+    this.ws.on("error", (error) => callbacks.onError?.(error, "transport"));
   }
 
   configure(

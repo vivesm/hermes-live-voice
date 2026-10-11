@@ -16,6 +16,28 @@ import {
 } from "../src/adapters/outbound/realtime/openai-realtime.adapter.js";
 
 describe("OpenAI Realtime adapter helpers", () => {
+  it("marks actual socket errors as transport diagnostics before readiness", async () => {
+    const server = createServer();
+    server.on("upgrade", (_request, socket) => socket.destroy());
+    server.listen(0, "127.0.0.1");
+    await once(server, "listening");
+    const address = server.address();
+    if (!address || typeof address === "string") throw new Error("Missing local fixture address.");
+    const errors: Array<{ error: unknown; origin: unknown }> = [];
+    try {
+      await expect(new OpenAIRealtimeAdapter(testOpenAIConfig({
+        apiKey: "test-key", baseUrl: `ws://127.0.0.1:${address.port}/v1/realtime`,
+      })).connect({
+        ...testConnectParams(),
+        callbacks: { onEvent: () => undefined, onError: (error, origin) => errors.push({ error, origin }) },
+      })).rejects.toThrow();
+      expect(errors).toHaveLength(1);
+      expect(errors[0]).toMatchObject({ origin: "transport", error: { code: "ECONNRESET" } });
+    } finally {
+      await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+    }
+  });
+
   it("normalizes audio and transcript deltas", () => {
     const audioEvents = normalizeOpenAIRealtimeEvent({ type: "response.output_audio.delta", delta: "abc", item_id: "item_1", content_index: 0 });
 

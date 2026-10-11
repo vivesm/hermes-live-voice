@@ -220,11 +220,12 @@ class HuggingFaceRealtimeSession implements LiveModelSession {
     private readonly pipelineReleaseGraceMs: number,
   ) {
     ws.on("message", (raw) => this.handleMessage(raw));
-    ws.on("error", (error) => callbacks.onError?.(error));
+    ws.on("error", (error) => callbacks.onError?.(error, "transport"));
     ws.on("close", (code, reason) => {
       this.providerClosedAt = Date.now();
       this.closing = true;
       this.reset();
+      callbacks.onTransportClose?.({ code });
       if (this.ready) callbacks.onClose?.({ code, reason: reason.toString("utf8") });
     });
   }

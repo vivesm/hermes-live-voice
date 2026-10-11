@@ -16,6 +16,36 @@ import {
 } from "../src/adapters/outbound/realtime/gemini-live.adapter.js";
 
 describe("Gemini Live adapter helpers", () => {
+  it("marks SDK transport errors and reports numeric transport closes", async () => {
+    const adapter = new GeminiLiveAdapter(testGeminiConfig({ apiKey: "fixture-key" }));
+    const callbacks: any[] = [];
+    const sdkSession = { close: () => undefined };
+    const client = { live: { connect: async (options: any) => {
+      callbacks.push(options.callbacks);
+      return sdkSession;
+    } } };
+    const createClient = vi.spyOn(adapter as any, "createClient").mockReturnValue(client);
+    const onError = vi.fn();
+    const onTransportClose = vi.fn();
+    const onClose = vi.fn();
+    try {
+      const session = await adapter.connect({
+        ...testConnectParams(),
+        callbacks: { onEvent: () => undefined, onError, onClose, onTransportClose } as any,
+      });
+      const sdkError = { error: Object.assign(new Error("PRIVATE_SDK_ERROR_MARKER"), { code: "EPIPE" }) };
+      callbacks[0].onerror(sdkError);
+      expect(onError).toHaveBeenCalledWith(sdkError, "transport");
+      const sdkClose = { code: 1006, reason: "PRIVATE_SDK_CLOSE_MARKER" };
+      callbacks[0].onclose(sdkClose);
+      expect(onTransportClose).toHaveBeenCalledWith({ code: 1006 });
+      expect(onClose).toHaveBeenCalledWith(sdkClose);
+      await session.close();
+    } finally {
+      createClient.mockRestore();
+    }
+  });
+
   it("enables input and output audio transcription for live sessions", () => {
     expect(buildGeminiLiveConnectConfig("test instruction")).toMatchObject({
       inputAudioTranscription: {},

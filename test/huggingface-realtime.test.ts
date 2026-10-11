@@ -17,6 +17,25 @@ afterEach(async () => {
 });
 
 describe("Hugging Face speech-to-speech adapter", () => {
+  it("diagnoses a pre-ready transport close without changing the ordinary close callback", async () => {
+    const server = new WebSocketServer({ host: "127.0.0.1", port: 0 });
+    servers.push(server);
+    await once(server, "listening");
+    const address = server.address();
+    if (!address || typeof address === "string") throw new Error("Missing local fixture address.");
+    server.on("connection", (socket) => socket.close(4001, "PRIVATE_STARTUP_CLOSE_MARKER"));
+    const onClose = vi.fn();
+    const onTransportClose = vi.fn();
+    await expect(new HuggingFaceRealtimeAdapter({
+      ...localConfig(), url: `ws://127.0.0.1:${address.port}`,
+    }).connect({
+      sessionId: "local_startup_close", systemInstruction: "fixture",
+      callbacks: { onEvent: () => undefined, onClose, onTransportClose } as any,
+    })).rejects.toThrow("closed before session start");
+    expect(onTransportClose).toHaveBeenCalledWith({ code: 4001 });
+    expect(onClose).not.toHaveBeenCalled();
+  });
+
   it("builds the upstream OpenAI Realtime wire contract at 24 kHz", () => {
     const update = buildHuggingFaceSessionUpdate(localConfig(), "Keep talking while tasks run.");
 

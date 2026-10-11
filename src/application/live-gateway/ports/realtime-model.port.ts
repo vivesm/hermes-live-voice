@@ -83,7 +83,10 @@ export interface LiveModelCallbacks {
   onEvent(event: LiveModelEvent): void;
   onOpen?(): void;
   onClose?(event?: unknown): void;
-  onError?(error: unknown): void;
+  /** Metadata only, including pre-ready closes; does not change readiness/cleanup. */
+  onTransportClose?(event: { code: number | null }): void;
+  /** Only adapters observing an actual socket/SDK error mark the transport origin. */
+  onError?(error: unknown, origin?: "transport"): void;
 }
 
 export interface LiveModelSession {

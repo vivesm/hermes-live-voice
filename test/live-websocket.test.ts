@@ -727,6 +727,7 @@ describe("live gateway WebSocket", () => {
     );
     await seedTaskState(config, [record]);
     const firstAttempt = deferred<void>();
+    const logger = fakeLogger();
     let attempts = 0;
     const provider = new RecordingLiveAdapter();
     provider.sessionFactory = (params) => {
@@ -735,12 +736,12 @@ describe("live gateway WebSocket", () => {
         attempts += 1;
         if (attempts === 1) {
           await firstAttempt.promise;
-          throw new Error("provider rejected notification");
+          throw new Error("PRIVATE_NOTIFICATION_ERROR_MARKER");
         }
       };
       return session;
     };
-    const server = await startTestServer({ config, hermes: new HermesHarness(), provider });
+    const server = await startTestServer({ config, hermes: new HermesHarness(), provider, logger });
     await readyClient(server.url, { expectedSnapshotReason: "reconnect" });
 
     await waitUntil(() => provider.latest.notificationCalls.length === 1);
@@ -749,6 +750,10 @@ describe("live gateway WebSocket", () => {
     await provider.latest.notifications.wait();
     expect(provider.latest.notificationCalls).toHaveLength(2);
     await waitUntil(() => storedTask(config.tasks.stateFile, record.taskId)?.notification?.announcedAt !== undefined);
+    expect(logger.warn).toHaveBeenCalledWith("task notification speech delivery failed", expect.objectContaining({
+      error: "realtime_provider_notification_failed",
+    }));
+    expect(JSON.stringify(vi.mocked(logger.warn).mock.calls)).not.toContain("PRIVATE_NOTIFICATION_ERROR_MARKER");
   });
 
   it("retries within the same session when provider speech succeeds but its durable marker fails", async () => {
@@ -1427,9 +1432,191 @@ describe("realtime provider lifecycle boundaries", () => {
     expect(provider.latest.closeCalls).toBe(1);
     expect(logger.error).toHaveBeenCalledWith(
       "failed to confirm realtime provider closure",
-      expect.objectContaining({ error: expect.stringContaining("deadline") }),
+      expect.objectContaining({ error: "realtime_provider_close_failed" }),
     );
   }, 8_000);
+});
+
+describe("bounded provider diagnostics", () => {
+  it.each(["text", "audio"] as const)("correlates the first transport error and close with monotonic %s output ages", async (output) => {
+    let now = 100;
+    vi.spyOn(performance, "now").mockImplementation(() => now);
+    const logger = fakeLogger();
+    const provider = new RecordingLiveAdapter();
+    const server = await startTestServer({ config: testConfig(), hermes: new HermesHarness(), provider, logger });
+    const client = await readyClient(server.url);
+
+    now = 200;
+    send(client.socket, { type: "text.input", text: "PRIVATE_INPUT_MARKER" });
+    await waitUntil(() => provider.latest.textInputs.length === 1);
+    await delay(0);
+    now = 300;
+    provider.emit(output === "text"
+      ? { type: "text", text: "PRIVATE_OUTPUT_MARKER", speaker: "assistant" }
+      : { type: "audio", audio: { data: "AQIDBA==", mimeType: "audio/pcm;rate=24000" } });
+    await client.messages.wait(output === "text" ? "transcript.delta" : "audio.output");
+    now = 350;
+    // User transcripts and lifecycle events are not assistant output.
+    provider.emit({ type: "text", text: "PRIVATE_TRANSCRIPT_MARKER", speaker: "user" });
+    provider.emit({ type: "response", status: "completed", responseId: "PRIVATE_RESPONSE_MARKER" });
+    now = 500;
+    const callbacks = provider.latest.params.callbacks as typeof provider.latest.params.callbacks & {
+      onError(error: unknown, origin: "transport"): void;
+    };
+    for (let index = 0; index < 100; index += 1) {
+      callbacks.onError(Object.assign(new Error("PRIVATE_TRANSPORT_MARKER"), {
+        code: index === 0 ? "ECONNRESET" : "EPIPE", payload: "PRIVATE_PAYLOAD_MARKER",
+      }), "transport");
+    }
+    const errors = vi.mocked(logger.warn).mock.calls.filter(([message]) => message === "realtime provider reported an error");
+    expect(errors).toHaveLength(1);
+    expect(errors[0]?.[1]).toEqual({
+      sessionId: client.ready.sessionId,
+      error: "realtime_provider_error",
+      errorSource: "transport",
+      transportErrorCode: "ECONNRESET",
+      connectionAttemptMs: 400,
+      connectionLifetimeMs: 400,
+      lastInputAgeMs: 300,
+      lastOutputAgeMs: 200,
+    });
+    now = 600;
+    for (let index = 0; index < 100; index += 1) {
+      provider.closeFromProvider({ code: 1006, reason: "PRIVATE_CLOSE_MARKER" });
+    }
+    const closes = vi.mocked(logger.info).mock.calls.filter(([message]) => message === "realtime provider session closed");
+    expect(closes).toHaveLength(1);
+    expect(closes[0]?.[1]).toEqual({
+      sessionId: client.ready.sessionId,
+      providerCode: 1006,
+      transportErrorCode: "ECONNRESET",
+      connectionAttemptMs: 500,
+      connectionLifetimeMs: 500,
+      lastInputAgeMs: 400,
+      lastOutputAgeMs: 300,
+    });
+    expect(JSON.stringify([vi.mocked(logger.info).mock.calls, vi.mocked(logger.warn).mock.calls])).not.toContain("PRIVATE_");
+    expect(JSON.stringify([vi.mocked(logger.info).mock.calls, vi.mocked(logger.warn).mock.calls])).not.toContain("AQIDBA==");
+    await expect(client.messages.waitForClose()).resolves.toMatchObject({ code: 1011 });
+  });
+
+  it("records pre-ready closure once without inventing an open lifetime", async () => {
+    let now = 100;
+    vi.spyOn(performance, "now").mockImplementation(() => now);
+    const logger = fakeLogger();
+    const provider = new RecordingLiveAdapter({ autoOpen: false });
+    const server = await startTestServer({ config: testConfig(), hermes: new HermesHarness(), provider, logger });
+    const client = await connectClient(server.url);
+    send(client.socket, { type: "session.start", protocolVersion: 3 });
+    await waitUntil(() => provider.connections.length === 1);
+    now = 160;
+    provider.closeFromProvider({ code: 1006, reason: "PRIVATE_PRE_READY_MARKER" });
+    provider.closeFromProvider({ code: 1000 });
+    const closes = vi.mocked(logger.info).mock.calls.filter(([message]) => message === "realtime provider session closed");
+    expect(closes).toHaveLength(1);
+    expect(closes[0]?.[1]).toMatchObject({
+      providerCode: 1006, transportErrorCode: "unknown", connectionAttemptMs: 60,
+      connectionLifetimeMs: null, lastInputAgeMs: null, lastOutputAgeMs: null,
+    });
+    await expect(client.messages.wait("session.error")).resolves.toMatchObject({ code: "session_start_failed" });
+    expect(JSON.stringify(vi.mocked(logger.info).mock.calls)).not.toContain("PRIVATE_PRE_READY_MARKER");
+  });
+
+  it.each([
+    { error: { code: "ECONNRESET", message: "PRIVATE_PAYLOAD_MARKER" }, origin: undefined, want: "unknown" },
+    { error: { code: "ECONNRESET PRIVATE_CODE_MARKER" }, origin: "transport", want: "unknown" },
+    { error: { code: "response_cancel_not_active" }, origin: "transport", want: "unknown" },
+    { error: { code: 1006 }, origin: "transport", want: "unknown" },
+    { error: { message: "EPIPE PRIVATE_MESSAGE_MARKER" }, origin: "transport", want: "unknown" },
+    { error: { error: { code: "ETIMEDOUT", message: "PRIVATE_SDK_MARKER" }, message: "PRIVATE_EVENT_MARKER" }, origin: "transport", want: "ETIMEDOUT" },
+  ])("only allows transport codes from the transport boundary: $want", async ({ error, origin, want }) => {
+    const logger = fakeLogger();
+    const provider = new RecordingLiveAdapter();
+    const server = await startTestServer({ config: testConfig(), hermes: new HermesHarness(), provider, logger });
+    const client = await readyClient(server.url);
+    const onError = provider.latest.params.callbacks.onError as (error: unknown, origin?: string) => void;
+    onError(error, origin);
+    expect(logger.warn).toHaveBeenCalledWith("realtime provider reported an error", expect.objectContaining({
+      sessionId: client.ready.sessionId, errorSource: origin ?? "provider", transportErrorCode: want,
+    }));
+    expect(JSON.stringify(vi.mocked(logger.warn).mock.calls)).not.toContain("PRIVATE_");
+  });
+
+  it.each([Number.NaN, Number.POSITIVE_INFINITY, -1, 90, Number.MAX_SAFE_INTEGER + 1])(
+    "omits invalid or backwards diagnostic timing %s", async (terminalTime) => {
+      let now = 100;
+      vi.spyOn(performance, "now").mockImplementation(() => now);
+      const logger = fakeLogger();
+      const provider = new RecordingLiveAdapter();
+      const server = await startTestServer({ config: testConfig(), hermes: new HermesHarness(), provider, logger });
+      await readyClient(server.url);
+      now = terminalTime;
+      provider.closeFromProvider({ code: Number.NaN, reason: "PRIVATE_INVALID_MARKER" });
+      expect(logger.info).toHaveBeenCalledWith("realtime provider session closed", expect.objectContaining({
+        providerCode: null, connectionAttemptMs: null, connectionLifetimeMs: null,
+        lastInputAgeMs: null, lastOutputAgeMs: null,
+      }));
+      expect(JSON.stringify(vi.mocked(logger.info).mock.calls)).not.toContain("PRIVATE_");
+    },
+  );
+
+  it("keeps a later real transport error when a provider payload error arrived first", async () => {
+    const logger = fakeLogger();
+    const provider = new RecordingLiveAdapter();
+    const server = await startTestServer({ config: testConfig(), hermes: new HermesHarness(), provider, logger });
+    await readyClient(server.url);
+    const onError = provider.latest.params.callbacks.onError as (error: unknown, origin?: string) => void;
+    for (let index = 0; index < 100; index += 1) onError({ code: "ECONNRESET", message: "PRIVATE_PROVIDER_MARKER" });
+    for (let index = 0; index < 100; index += 1) onError({ code: "EPIPE", message: "PRIVATE_TRANSPORT_MARKER" }, "transport");
+    const errors = vi.mocked(logger.warn).mock.calls.filter(([message]) => message === "realtime provider reported an error");
+    expect(errors).toHaveLength(2);
+    expect(errors[0]?.[1]).toMatchObject({ errorSource: "provider", transportErrorCode: "unknown" });
+    expect(errors[1]?.[1]).toMatchObject({ errorSource: "transport", transportErrorCode: "EPIPE" });
+    expect(vi.mocked(logger.warn).mock.calls.filter(([message]) => message === "live session error")).toHaveLength(2);
+  });
+
+  it("sanitizes input and close-operation failures without claiming a successful input", async () => {
+    let now = 100;
+    vi.spyOn(performance, "now").mockImplementation(() => now);
+    const logger = fakeLogger();
+    const provider = new RecordingLiveAdapter();
+    const server = await startTestServer({ config: testConfig(), hermes: new HermesHarness(), provider, logger });
+    const client = await readyClient(server.url);
+    provider.latest.textBehavior = async () => { throw new Error("PRIVATE_INPUT_FAILURE_MARKER"); };
+    provider.latest.closeBehavior = async () => { throw new Error("PRIVATE_CLOSE_FAILURE_MARKER"); };
+    now = 200;
+    send(client.socket, { type: "text.input", text: "PRIVATE_INPUT_MARKER" });
+    await client.messages.waitForClose();
+    expect(logger.warn).toHaveBeenCalledWith("realtime provider rejected client input", expect.objectContaining({
+      error: "realtime_provider_input_failed", transportErrorCode: "unknown", lastInputAgeMs: null,
+    }));
+    expect(logger.error).toHaveBeenCalledWith("failed to confirm realtime provider closure", expect.objectContaining({
+      error: "realtime_provider_close_failed", transportErrorCode: "unknown",
+    }));
+    expect(JSON.stringify([vi.mocked(logger.warn).mock.calls, vi.mocked(logger.error).mock.calls])).not.toContain("PRIVATE_");
+  });
+
+  it("keeps cancellation and invalid provider-event exception text out of logs", async () => {
+    const logger = fakeLogger();
+    const provider = new RecordingLiveAdapter();
+    const server = await startTestServer({ config: testConfig(), hermes: new HermesHarness(), provider, logger });
+    const client = await readyClient(server.url);
+    provider.latest.cancelResponse = async () => { throw new Error("PRIVATE_CANCEL_MARKER"); };
+    send(client.socket, { type: "response.cancel" });
+    await client.messages.wait("log", (message) => message.message === "Realtime response cancellation failed");
+    provider.emit({ type: "audio", audio: {
+      get data(): string { throw new Error("PRIVATE_EVENT_EXCEPTION_MARKER"); },
+      mimeType: "audio/pcm;rate=24000",
+    } });
+    await client.messages.waitForClose();
+    expect(JSON.stringify(vi.mocked(logger.warn).mock.calls)).not.toContain("PRIVATE_");
+    expect(logger.warn).toHaveBeenCalledWith("failed to cancel realtime response", expect.objectContaining({
+      error: "realtime_provider_cancel_failed",
+    }));
+    expect(logger.warn).toHaveBeenCalledWith("invalid realtime provider event", expect.objectContaining({
+      error: "realtime_provider_event_invalid",
+    }));
+  });
 });
 
 describe("transport, tool-call, and notification safety", () => {

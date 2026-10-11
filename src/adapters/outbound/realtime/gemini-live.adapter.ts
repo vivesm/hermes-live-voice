@@ -7,6 +7,7 @@ import {
   type AppConfig,
 } from "../../../config.js";
 import { selectHermesLiveToolDeclarations } from "../../../application/live-gateway/tool-definitions.js";
+import { providerCloseCode } from "../../../application/live-gateway/provider-diagnostics.js";
 import {
   requireLiveTaskNotification,
   type LiveModelAdapter,
@@ -47,9 +48,10 @@ export class GeminiLiveAdapter implements LiveModelAdapter {
         onopen: () => params.callbacks.onOpen?.(),
         onclose: (event: unknown) => {
           closeConfirmation.confirm();
+          params.callbacks.onTransportClose?.({ code: providerCloseCode(event) });
           params.callbacks.onClose?.(event);
         },
-        onerror: (event: unknown) => params.callbacks.onError?.(event),
+        onerror: (event: unknown) => params.callbacks.onError?.(event, "transport"),
         onmessage: forwardMessage,
       },
     });

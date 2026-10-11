@@ -22,6 +22,7 @@ import {
 } from "../../domain/protocol/version.js";
 import type { TaskExecutionMode, TaskRecord } from "../../domain/tasks/index.js";
 import { realtimeClientCapabilities } from "./client-capabilities.js";
+import { ProviderSessionDiagnostics } from "./provider-diagnostics.js";
 import type { ClientConnectionPort, ClientInboundFrame } from "./ports/client-connection.port.js";
 import type { HermesRunsPort, HermesSessionSummary } from "./ports/hermes-runs.port.js";
 import type { TaskSupervisorPort } from "./ports/task-supervisor.port.js";
@@ -120,6 +121,7 @@ export class LiveGatewaySession {
   private activeProviderToolOperations = 0;
   private pendingProviderToolCalls = 0;
   private cachedProviderToolResponseBytes = 0;
+  private readonly providerDiagnostics = new ProviderSessionDiagnostics();
 
   constructor(
     private readonly client: ClientConnectionPort,
@@ -197,6 +199,7 @@ export class LiveGatewaySession {
       // promise before startup cleanup can attach its await.
       void providerOpen.catch(() => undefined);
 
+      this.providerDiagnostics.beginAttempt();
       const connect = this.deps.liveModel.connect({
         sessionId: this.id,
         systemInstruction: buildSystemInstruction(
@@ -212,37 +215,39 @@ export class LiveGatewaySession {
         safetyIdentifier: safetyIdentifierForSessionKey(this.sessionKey),
         callbacks: {
           onOpen: () => {
+            this.providerDiagnostics.opened();
             providerOpened = true;
             resolveOpen();
           },
+          onTransportClose: (event) => this.logProviderClose(event),
           onClose: (event) => {
+            this.logProviderClose(event);
             if (!this.readySent) {
               rejectOpen(new Error("Realtime provider session closed before ready."));
               return;
             }
-            this.deps.logger.info("realtime provider session closed", {
-              sessionId: this.id,
-              ...providerCloseLogDetail(event),
-            });
             if (this.closing) return;
             this.fail("realtime_provider_closed", new Error("Realtime provider session closed."), true);
             void this.closeClientAfterCleanup(1011, "realtime provider closed");
           },
-          onError: (error) => {
+          onError: (error, origin) => {
+            const detail = this.providerDiagnostics.error(error, origin === "transport" ? "transport" : "provider");
+            if (detail) this.deps.logger.warn("realtime provider reported an error", {
+              sessionId: this.id, error: "realtime_provider_error", ...detail,
+            });
             if (!this.readySent) {
               rejectOpen(new Error(publicRealtimeStartupError(error, this.deps.config.server.providerReadyTimeoutMs)));
               return;
             }
-            this.deps.logger.warn("realtime provider reported an error", {
-              sessionId: this.id,
-              error: "realtime_provider_error",
-            });
             if (!this.closing) {
-              this.fail("realtime_provider_error", new Error("Realtime provider reported an error."), true);
+              this.fail("realtime_provider_error", new Error("Realtime provider reported an error."), true, undefined, detail !== undefined);
             }
           },
           onEvent: (event) => {
             if (this.closing) return;
+            if (event.type === "audio" || (event.type === "text" && (event.speaker ?? "assistant") === "assistant")) {
+              this.providerDiagnostics.outputObserved();
+            }
             if (!this.readySent) {
               const bytes = safeJsonByteLength(event);
               if (
@@ -367,6 +372,12 @@ export class LiveGatewaySession {
       for (const event of providerEvents) this.dispatchLiveModelEvent(event);
       this.scheduleNotificationFlush();
     } catch (error) {
+      if (startupPhase === "realtime") {
+        const detail = this.providerDiagnostics.error(error, "connect");
+        if (detail) this.deps.logger.warn("realtime provider reported an error", {
+          sessionId: this.id, error: "realtime_provider_error", ...detail,
+        });
+      }
       if (this.pendingLiveConnect) {
         const lateConnect = this.pendingLiveConnect;
         this.pendingLiveConnect = undefined;
@@ -382,7 +393,7 @@ export class LiveGatewaySession {
         this.deps.logger.warn("live session startup failed", {
           sessionId: this.id,
           phase: startupPhase,
-          ...startupFailureLogDetail(error),
+          ...(startupPhase === "hermes" ? startupFailureLogDetail(error) : { error: "startup_failed" }),
         });
         this.fail(
           "session_start_failed",
@@ -1026,7 +1037,7 @@ export class LiveGatewaySession {
     try {
       this.handleLiveModelEvent(event);
     } catch (error) {
-      this.deps.logger.warn("invalid realtime provider event", { sessionId: this.id, error: errorToMessage(error) });
+      this.deps.logger.warn("invalid realtime provider event", { sessionId: this.id, error: "realtime_provider_event_invalid" });
       this.fail("realtime_provider_event_invalid", new Error("Realtime provider emitted an invalid event."), false);
       void this.closeClientAfterCleanup(1011, "invalid realtime provider event");
     }
@@ -1316,7 +1327,7 @@ export class LiveGatewaySession {
       if (!this.closing) {
         this.deps.logger.warn("task notification speech delivery failed", {
           sessionId: this.id,
-          error: errorToMessage(error),
+          error: "realtime_provider_notification_failed",
         });
       }
     } finally {
@@ -1384,13 +1395,15 @@ export class LiveGatewaySession {
         MAX_PROVIDER_IO_WAIT_MS,
         `Realtime provider ${label} input did not settle before the safety deadline.`,
       );
+      this.providerDiagnostics.inputAccepted();
     } catch (error) {
       if (beginsResponse) this.providerResponseActive = false;
       if (this.closing) return;
       this.deps.logger.warn("realtime provider rejected client input", {
         sessionId: this.id,
         input: label,
-        error: errorToMessage(error),
+        error: "realtime_provider_input_failed",
+        ...this.providerDiagnostics.snapshot(),
       });
       this.fail("realtime_provider_input_failed", new Error(`Realtime provider could not confirm ${label} input.`), false);
       await this.closeClientAfterCleanup(1011, "realtime provider input failed");
@@ -1415,7 +1428,7 @@ export class LiveGatewaySession {
       if (!this.closing) {
         this.deps.logger.warn("failed to cancel realtime response", {
           sessionId: this.id,
-          error: errorToMessage(error),
+          error: "realtime_provider_cancel_failed",
         });
         this.send({ type: "log", level: "warn", message: "Realtime response cancellation failed" });
       }
@@ -1452,10 +1465,10 @@ export class LiveGatewaySession {
         closeLateSession,
         MAX_PROVIDER_CLOSE_WAIT_MS,
         "Pending realtime provider connection did not settle before the close deadline.",
-      ).catch((error) => {
+      ).catch(() => {
         this.deps.logger.error("failed to confirm pending realtime provider closure", {
           sessionId: this.id,
-          error: errorToMessage(error),
+          error: "realtime_provider_pending_close_failed",
         });
       }));
     }
@@ -1467,12 +1480,18 @@ export class LiveGatewaySession {
       Promise.resolve().then(() => session.close()),
       MAX_PROVIDER_CLOSE_WAIT_MS,
       "Realtime provider did not confirm closure before the safety deadline.",
-    ).catch((error) => {
+    ).catch(() => {
       this.deps.logger.error("failed to confirm realtime provider closure", {
         sessionId: this.id,
-        error: errorToMessage(error),
+        error: "realtime_provider_close_failed",
+        ...this.providerDiagnostics.snapshot(),
       });
     });
+  }
+
+  private logProviderClose(event: unknown): void {
+    const detail = this.providerDiagnostics.closed(event);
+    if (detail) this.deps.logger.info("realtime provider session closed", { sessionId: this.id, ...detail });
   }
 
   private async closeClientAfterCleanup(code: number, reason: string): Promise<void> {
@@ -1498,10 +1517,13 @@ export class LiveGatewaySession {
     }
   }
 
-  private fail(code: string, error: unknown, recoverable = false, requestId?: string): void {
+  private fail(code: string, error: unknown, recoverable = false, requestId?: string, log = true): void {
     const message = boundedText(errorToMessage(error), 2_000);
     const safeRequestId = validatedRequestId(requestId);
-    this.deps.logger.warn("live session error", { sessionId: this.id, code, message });
+    if (log) this.deps.logger.warn("live session error", {
+      sessionId: this.id, code,
+      ...(code === "session_start_failed" || code.startsWith("realtime_") ? {} : { message }),
+    });
     this.send({
       type: "session.error",
       code,
@@ -1827,14 +1849,6 @@ function publicRealtimeStartupError(error: unknown, readyTimeoutMs: number): str
     return boundedText(message, 500);
   }
   return `Realtime provider session failed to start within ${readyTimeoutMs}ms. Check the gateway logs.`;
-}
-
-function providerCloseLogDetail(value: unknown): Record<string, unknown> {
-  if (!value || typeof value !== "object" || Array.isArray(value)) return {};
-  const code = (value as Record<string, unknown>).code;
-  return typeof code === "number" && Number.isInteger(code) && code >= 1_000 && code <= 4_999
-    ? { providerCode: code }
-    : {};
 }
 
 function publicProviderIdentifier(value: unknown): string | undefined {
