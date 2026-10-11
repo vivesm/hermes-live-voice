@@ -1,9 +1,13 @@
 # Provider diagnostics local test evidence
 
-Worktree: `/Users/melvin/Developer/hermes-live-cutoff-diagnostics-wt`  
-Branch: `slice/voice-cutoff-diagnostics`  
-Base: `3bb74b236659e6a167bc3ee40a934dd2402462e5`  
-Frozen tested source commit: `1e61fe403fc468322af7ad72c93515e2148f53c8`  
+Worktree: `/Users/melvin/Developer/hermes-live-cutoff-diagnostics-wt`
+
+Branch: `slice/voice-cutoff-diagnostics`
+
+Base: `3bb74b236659e6a167bc3ee40a934dd2402462e5`
+
+Frozen tested source commit: `1e61fe403fc468322af7ad72c93515e2148f53c8`
+
 Date: 2026-10-11. Native Sol implementation lane. Node `v26.7.0`.
 
 ## Changes and scope
@@ -33,7 +37,7 @@ Input, cancellation, close, invalid-provider-event and notification speech failu
 | `npm run build` | Exit 0; local `dist` rebuilt successfully. Generated output is ignored and was not committed/installed. |
 | `node scripts/gateway-smoke.mjs --live-provider mock` | Exit 0; `Gateway smoke ok (mock provider)`. Explicit loopback mock only; no Docker option or external provider. |
 | Final `npm test` | Exit 0; 42 files, **791 tests passed**, no skipped tests, no failures. 14.16 seconds. |
-| `git diff --check` | Exit 0. |
+| `git diff --check` | Source working tree: exit 0. The later base-to-HEAD check flagged four Markdown hard-break trailing-space lines in this report (exit 2); normalized those report-only lines and reran cleanly. |
 
 Raw local command outputs are in ignored `.lanes/artifacts/*-tests.log`, `diagnostics-red.log`, `adapter-close-red.log`, `provider-event-privacy-red.log`, `notification-and-duplicate-red.log`, `typecheck*.log`, `build.log`, and `gateway-mock.log`. Synthetic privacy markers in intentional RED output are test fixtures, never captured production speech/credentials.
 
